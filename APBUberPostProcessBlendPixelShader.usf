@@ -12,14 +12,21 @@
 
 #include "Common.usf"
 #include "PostProcessCommon.usf"
-#include "DepthOfFieldCommon.usf"
 
-#define SEPARATE_BLOOM 1
+#include "APBr-Shader-ModManagerSettings.usf"
+
+#if !MODMANAGER_ENABLE_RTW
+	#include "DepthOfFieldCommon.usf"
+
+	#define SEPARATE_BLOOM 1
+#endif
 
 sampler2D BlurredImage;
 
-#if SEPARATE_BLOOM
-sampler2D BlurredImageSeperateBloom;
+#if !MODMANAGER_ENABLE_RTW
+	#if SEPARATE_BLOOM
+		sampler2D BlurredImageSeperateBloom;
+	#endif
 #endif
 
 // Tone-mapping parameters.
@@ -33,6 +40,11 @@ float Contrast;
 float Saturation;
 float3 DesaturatedColour;
 
+#if MODMANAGER_ENABLE_RTW
+	float ColourPower;
+	float3 PerChannelPower;
+#endif
+
 #if USE_COLORGRADING
 sampler2D ColorGradingLUT;
 #endif // USE_COLORGRADING
@@ -40,42 +52,44 @@ sampler2D ColorGradingLUT;
 // The per-color weighting to be used for luminance calculations in RGB order.
 static const half3 LuminanceVector = float3(0.3, 0.59, 0.11);
 
-// Calculate DOF and bloom for the pixel.
-float3 ApplyDOFAndBloom(half4 FocusedSceneColorAndDepth, float2 UV)
-{
-#if SEPARATE_BLOOM
-	// Sample DoF colour and blurred foreground circle of confusion.
-	half4 DOFColorAndWeight = MAX_SCENE_COLOR * tex2D(BlurredImage,UV);
+#if !MODMANAGER_ENABLE_RTW
+	// Calculate DOF and bloom for the pixel.
+	float3 ApplyDOFAndBloom(half4 FocusedSceneColorAndDepth, float2 UV)
+	{
+	#if SEPARATE_BLOOM
+		// Sample DoF colour and blurred foreground circle of confusion.
+		half4 DOFColorAndWeight = MAX_SCENE_COLOR * tex2D(BlurredImage,UV);
+	
+		half UnblurredForegroundCoC = CalcForegroundUnfocusedPercent(FocusedSceneColorAndDepth.a);
+		half BlurredForegroundCoC = DOFColorAndWeight.a;
+	
+		// Combine blurred and unblurred CoC to get max area CoC.
+		half ForegroundCoC = saturate(2 * max(UnblurredForegroundCoC, BlurredForegroundCoC) - UnblurredForegroundCoC);
+	
+		// Combine foreground and background.
+		half CoC = max(ForegroundCoC, CalcBackgroundUnfocusedPercent(FocusedSceneColorAndDepth.a));
+	
+		// Lerp between blurred and unblurred based on CoC.
+		half3 Result = lerp(FocusedSceneColorAndDepth.rgb, DOFColorAndWeight.rgb, CoC);
+	
+		// Add in bloom contribution.
+		Result += MAX_SCENE_COLOR * tex2D(BlurredImageSeperateBloom, UV).rgb;
+		return Result;
+	
+	#else
+	
+		half FocusedWeight = saturate(1 - CalcUnfocusedPercent(FocusedSceneColorAndDepth.a));
+	
+		//Scale color back up as it was compressed to the [0-1] range to fit in the fixed point filter buffer
+		half4 UnfocusedSceneColorAndWeight = MAX_SCENE_COLOR * tex2D(BlurredImage, UV);
+	
+		half  WeightSum = max(FocusedWeight + saturate(UnfocusedSceneColorAndWeight.a), 0.001);
+		float3 BloomResult = (FocusedSceneColorAndDepth.rgb * FocusedWeight + UnfocusedSceneColorAndWeight.rgb) / WeightSum;
 
-	half UnblurredForegroundCoC = CalcForegroundUnfocusedPercent(FocusedSceneColorAndDepth.a);
-	half BlurredForegroundCoC = DOFColorAndWeight.a;
-
-	// Combine blurred and unblurred CoC to get max area CoC.
-	half ForegroundCoC = saturate(2 * max(UnblurredForegroundCoC, BlurredForegroundCoC) - UnblurredForegroundCoC);
-
-	// Combine foreground and background.
-	half CoC = max(ForegroundCoC, CalcBackgroundUnfocusedPercent(FocusedSceneColorAndDepth.a));
-
-	// Lerp between blurred and unblurred based on CoC.
-	half3 Result = lerp(FocusedSceneColorAndDepth.rgb, DOFColorAndWeight.rgb, CoC);
-
-	// Add in bloom contribution.
-	Result += MAX_SCENE_COLOR * tex2D(BlurredImageSeperateBloom, UV).rgb;
-	return Result;
-
-#else
-
-	half FocusedWeight = saturate(1 - CalcUnfocusedPercent(FocusedSceneColorAndDepth.a));
-
-	//Scale color back up as it was compressed to the [0-1] range to fit in the fixed point filter buffer
-	half4 UnfocusedSceneColorAndWeight = MAX_SCENE_COLOR * tex2D(BlurredImage, UV);
-
-    half  WeightSum = max(FocusedWeight + saturate(UnfocusedSceneColorAndWeight.a), 0.001);
-	float3 BloomResult = (FocusedSceneColorAndDepth.rgb * FocusedWeight + UnfocusedSceneColorAndWeight.rgb) / WeightSum;
-
-	return BloomResult;
+		return BloomResult;
+	#endif
+	}
 #endif
-}
 
 // SJT: Perform tone mapping on a pixel.
 half3 ToneMap(float3 WorldColour)
@@ -117,44 +131,45 @@ void Main(
 	out float4 OutColor : COLOR0
 	)
 {
-	half4 FocusedSceneColorAndDepth = CalcSceneColorAndDepth(SceneUV);
+	#if MODMANAGER_ENABLE_RTW
+			//Scale color back up as it was compressed to the [0-1] range to fit in the fixed point filter buffer
+		half4 rawColor = tex2D(BlurredImage,UV);
+		float3 filteredColor = MAX_SCENE_COLOR * rawColor.rgb * BloomPostScale;
+	
+		float4 sceneColor=tex2D(SceneColorTexture,SceneUV);
+	
+		float3 BloomResult = 1-(saturate(1-(filteredColor.rgb*BloomAlpha))*saturate(1-lerp(sceneColor.rgb, 0, BloomAlpha*saturate(rawColor.a*4))));
+	
+		// SJT: Tone map the HDR colour.
+		half3 ToneMappedColour = ToneMap(BloomResult);
+	#else
+		half4 FocusedSceneColorAndDepth = CalcSceneColorAndDepth(SceneUV);
+	
+		// Apply depth of field and bloom.
+		float3 DOFBloomResult = ApplyDOFAndBloom(FocusedSceneColorAndDepth, UV);
+	
+		// SJT: Tone map the HDR colour.
+		half3 ToneMappedColour = ToneMap(DOFBloomResult);
+	#endif
+	
+	//  APBr-Shader-ModManager color correction
+	
+	#if MODMANAGER_ENABLE_NOBLUE
+			half3 AdjustedColour = ColourAdjust(ToneMappedColour);
+	#else
+			half3 AdjustedColour = ColorLookupTable(ColorGradingLUT, ToneMappedColour);
+	#endif // MODMANAGER_ENABLE_NOBLUE
 
-	// Apply depth of field and bloom.
-	float3 DOFBloomResult = ApplyDOFAndBloom(FocusedSceneColorAndDepth, UV);
-
-	// SJT: Tone map the HDR colour.
-	half3 ToneMappedColour = ToneMap(DOFBloomResult);
-
-#if USE_COLORGRADING
-	//no thanks
-	//half3 AdjustedColour = ColorLookupTable(ColorGradingLUT, ToneMappedColour);
-	half3 AdjustedColour = ColourAdjust(ToneMappedColour);
-#else
-	// SJT: Perform colour adjustment.
-	half3 AdjustedColour = ColourAdjust(ToneMappedColour);
-#endif // USE_COLORGRADING
-
-	// Gamma correction.
-	// DISABLED: This wasn't used when the UI is shown (i.e. most of the time!),
-	// and costs a big chunk of time, so I've disabled it.
-	//half3 LinearColor = AdjustedColour * GammaColorScale + GammaOverlayColor;
-	//OutColor = float4(pow(saturate(LinearColor), GammaInverse), FocusedSceneColorAndDepth.a);
 	OutColor = float4(AdjustedColour, FocusedSceneColorAndDepth.a);
 	
-	float2 ScreenSize = float2( 1.0 / 1920, 1.0 / 1080 );
-	float flDepth  = CalcSceneDepth( SceneUV );
-	float flDepthTop    = abs(flDepth - CalcSceneDepth( SceneUV + float2(0.0, -ScreenSize.y) ) );
-	float flDepthLeft   = abs(flDepth - CalcSceneDepth( SceneUV + float2(-ScreenSize.x,  0.0 ) ) );
-	float flDepthRight  = abs(flDepth - CalcSceneDepth( SceneUV + float2(ScreenSize.x,  0.0 ) ) );
-	float flDepthBottom = abs(flDepth - CalcSceneDepth( SceneUV + float2(0.0, ScreenSize.y ) ) );
-	flDepthTop /= 100.0;flDepthLeft/= 100.0;flDepthRight /= 100.0;flDepthBottom /= 100.0;flDepth /= 100.0;
-	
-	if(flDepthTop >= 0.1 * flDepth && flDepthTop <= 500.0 || flDepthLeft >= 0.1 * flDepth && flDepthLeft <= 500.0 || flDepthRight >= 0.1 * flDepth && flDepthRight <= 500.0 || flDepthBottom >= 0.1 * flDepth && flDepthBottom <= 500.0)
-	{
-		OutColor = float4(0.0, 0.0, 0.0, 1.0);
-	}
-		
-	#include "Crosshair.usf"
-	//#include "SkyrimMod.usf"
+	#if MODMANAGER_ENABLE_SKYRIMMOD
+		#include "SkyrimMod.usf"
+	#endif
+	#if MODMANAGER_ENABLE_OUTLINE
+		#include "OutlinePixelShader.usf"
+	#endif
+	#if MODMANAGER_ENABLE_CROSSHAIR
+		#include "Crosshair.usf"
+	#endif
 	
 }
