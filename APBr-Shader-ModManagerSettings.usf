@@ -1,0 +1,13 @@
+/***************************************************************************************/
+/*! \file APBr-Shader-ModManager.usf
+* 
+* Modual shadermod manager, enables multiple shader mods to play nicely together.
+* 
+* Use this to enable or disable various shader mods
+****************************************************************************************/
+
+#define MODMANAGER_ENABLE_RTW 0
+#define MODMANAGER_ENABLE_NOBLUE 1
+#define MODMANAGER_ENABLE_SKYRIMMOD 0
+#define MODMANAGER_ENABLE_OUTLINE 1
+#define MODMANAGER_ENABLE_CROSSHAIR 1
